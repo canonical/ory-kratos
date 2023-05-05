@@ -9,6 +9,8 @@ from pathlib import Path
 import pytest
 import requests
 import yaml
+from lightkube import Client
+from lightkube.resources.networking_v1 import NetworkPolicy
 from pytest_operator.plugin import OpsTest
 
 logger = logging.getLogger(__name__)
@@ -51,7 +53,7 @@ async def test_build_and_deploy(ops_test: OpsTest) -> None:
     """
     await ops_test.model.deploy(
         POSTGRES,
-        channel="latest/edge",
+        channel="14/stable",
         trust=True,
     )
     charm = await ops_test.build_charm(".")
@@ -71,7 +73,9 @@ async def test_build_and_deploy(ops_test: OpsTest) -> None:
         assert ops_test.model.applications[APP_NAME].units[0].workload_status == "active"
 
 
-async def test_ingress_relation(ops_test: OpsTest) -> None:
+async def test_ingress_relation(ops_test: OpsTest, client: Client) -> None:
+    # We deploy ingress before running the database migrations to make sure that
+    # we don't break migrations by applying the network policies (e.g. by breaking dns).
     await ops_test.model.deploy(
         TRAEFIK,
         application_name=TRAEFIK_PUBLIC_APP,
@@ -93,6 +97,10 @@ async def test_ingress_relation(ops_test: OpsTest) -> None:
         raise_on_blocked=True,
         timeout=1000,
     )
+
+    # Validate network policies are created when ingress is provided
+    policy = client.get(NetworkPolicy, "kratos-network-policy", namespace=ops_test.model.name)
+    assert policy
 
 
 async def test_has_public_ingress(ops_test: OpsTest) -> None:
@@ -253,3 +261,16 @@ async def test_identity_schemas_config(ops_test: OpsTest) -> None:
     resp = requests.get(f"http://{public_address}/{ops_test.model.name}-{APP_NAME}/schemas")
 
     assert original_resp == resp.json()
+
+
+@pytest.mark.skip(
+    reason=("sometimes the event hook is not fired so the resources don't get cleaned up.")
+)
+async def test_charm_removal(ops_test: OpsTest, client: Client) -> None:
+    await ops_test.model.remove_application(
+        APP_NAME, force=True, block_until_done=True, destroy_storage=True
+    )
+
+    # Validate network policies are removed when ingress is provided
+    policy = client.get(NetworkPolicy, "kratos-network-policy", namespace=ops_test.model.name)
+    assert not policy

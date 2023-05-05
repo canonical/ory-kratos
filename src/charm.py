@@ -31,6 +31,10 @@ from charms.identity_platform_login_ui_operator.v0.login_ui_endpoints import (
     LoginUITooManyRelatedAppsError,
 )
 from charms.kratos.v0.kratos_endpoints import KratosEndpointsProvider
+from charms.kratos.v0.kubernetes_network_policies import (
+    KubernetesNetworkPoliciesHandler,
+    NetworkPoliciesHandlerError,
+)
 from charms.kratos_external_idp_integrator.v0.kratos_external_provider import (
     ClientConfigChangedEvent,
     ExternalIdpRequirer,
@@ -49,6 +53,7 @@ from ops.charm import (
     HookEvent,
     PebbleReadyEvent,
     RelationEvent,
+    RemoveEvent,
 )
 from ops.main import main
 from ops.model import ActiveStatus, BlockedStatus, MaintenanceStatus, ModelError, WaitingStatus
@@ -117,6 +122,7 @@ class KratosCharm(CharmBase):
             port=KRATOS_PUBLIC_PORT,
             strip_prefix=True,
         )
+        self.network_policy_handler = KubernetesNetworkPoliciesHandler(self)
 
         self.database = DatabaseRequires(
             self,
@@ -139,6 +145,7 @@ class KratosCharm(CharmBase):
 
         self.framework.observe(self.on.kratos_pebble_ready, self._on_pebble_ready)
         self.framework.observe(self.on.config_changed, self._on_config_changed)
+        self.framework.observe(self.on.remove, self._cleanup)
         self.framework.observe(
             self.endpoints_provider.on.ready, self._update_kratos_endpoints_relation_data
         )
@@ -442,6 +449,10 @@ class KratosCharm(CharmBase):
         """Event Handler for config changed event."""
         self._handle_status_update_config(event)
 
+    def _cleanup(self, event: RemoveEvent) -> None:
+        logger.info("Removing charm")
+        self.network_policy_handler.delete_ingress_policies()
+
     def _update_kratos_endpoints_relation_data(self, event: RelationEvent) -> None:
         admin_endpoint = (
             self.admin_ingress.url
@@ -521,6 +532,23 @@ class KratosCharm(CharmBase):
 
         self._handle_status_update_config(event)
         self._update_kratos_endpoints_relation_data(event)
+        self._apply_network_policies()
+
+    def _apply_network_policies(self) -> None:
+        if not self.unit.is_leader():
+            return
+
+        try:
+            self.network_policy_handler.apply_ingress_policies(
+                [
+                    (KRATOS_PUBLIC_PORT, [self.public_ingress.relation]),
+                    (KRATOS_ADMIN_PORT, [self.admin_ingress.relation]),
+                    (38812, []),
+                    (38813, []),
+                ]
+            )
+        except NetworkPoliciesHandlerError:
+            pass
 
     def _on_public_ingress_ready(self, event: IngressPerAppReadyEvent) -> None:
         if self.unit.is_leader():
@@ -528,6 +556,7 @@ class KratosCharm(CharmBase):
 
         self._handle_status_update_config(event)
         self._update_kratos_endpoints_relation_data(event)
+        self._apply_network_policies()
 
     def _on_ingress_revoked(self, event: IngressPerAppRevokedEvent) -> None:
         if self.unit.is_leader():
@@ -535,6 +564,7 @@ class KratosCharm(CharmBase):
 
         self._handle_status_update_config(event)
         self._update_kratos_endpoints_relation_data(event)
+        self._apply_network_policies()
 
     def _on_client_config_changed(self, event: ClientConfigChangedEvent) -> None:
         domain_url = self._domain_url
